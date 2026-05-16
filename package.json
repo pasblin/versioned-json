@@ -1,12 +1,20 @@
 {
   "name": "@pasblin/versioned-json",
   "version": "0.0.0",
-  "description": "Framework-agnostic TypeScript library for versioned JSON.",
+  "description": "Framework-agnostic lifecycle toolkit for versioned JSON: migrations, deprecations, retirement and pluggable validators.",
   "keywords": [
     "json",
-    "versioned",
+    "versioning",
+    "schema",
+    "migration",
+    "migrations",
+    "deprecation",
+    "lifecycle",
+    "validator",
+    "validation",
+    "zod",
     "typescript",
-    "library"
+    "framework-agnostic"
   ],
   "homepage": "https://github.com/pasblin/versioned-json#readme",
   "bugs": {
@@ -50,7 +58,8 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsup",
