@@ -1,0 +1,554 @@
+# @pasblin/versioned-json
+
+[![CI](https://github.com/pasblin/versioned-json/actions/workflows/ci.yml/badge.svg)](https://github.com/pasblin/versioned-json/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/@pasblin/versioned-json.svg)](https://www.npmjs.com/package/@pasblin/versioned-json)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
+> Framework-agnostic TypeScript library for versioned JSON.
+
+Works in **any** JavaScript / TypeScript project: Angular, React, Vue, Svelte, Node.js, Deno, Bun, etc.
+
+## What problem does it solve?
+
+Long-lived JSON documents change shape over time. Once a doc is in production
+you cannot just rename a field, drop a column or tighten a type without
+breaking every document already stored somewhere. `versioned-json` gives you a
+small, opinionated toolkit to manage that lifecycle:
+
+- **Per-version schemas**: describe what each historical version looks like.
+- **Pure forward migrations**: `v(n) → v(n+1)`, no skipping, enforced at
+  registry build time.
+- **One typed result**: the public API always returns the latest version
+  type, regardless of how old the input was.
+- **Errors vs warnings**: validation produces structured `ValidationIssue`s,
+  not exceptions, so consumers can render them in UIs.
+- **Deprecations as data**: mark a field deprecated on any schema; the
+  registry walks both the source document (using the source schema's
+  deprecations) and the migrated latest document (using the latest schema's
+  deprecations), so warnings fire even for fields that the migration chain
+  removes or renames before reaching the latest shape.
+- **Lifecycle hooks for legacy retirement**: bump `minSupportedVersion` to
+  soft-retire old versions before deleting their migrations.
+
+## Project policy
+
+This library enforces (or makes it easy to enforce) the following rules:
+
+1. **Never remove fields directly** — deprecate them first.
+2. **Never change the meaning of an existing field** — add a new one and
+   deprecate the old.
+3. **New fields always ship with an explicit default**, applied by a
+   migration.
+4. **Every new version requires a migration from the previous one** —
+   missing steps fail at registry build time.
+5. **The internal model is always the latest version** — callers never see
+   intermediate shapes.
+6. **Validators distinguish error from warning** — `severity: 'error'`
+   blocks the result, `severity: 'warning'` does not.
+7. **Tests include real fixtures of old versions** — see
+   `src/__tests__/recipe/fixtures/`.
+
+## Install
+
+```bash
+npm install @pasblin/versioned-json
+# To use the optional Zod adapter:
+npm install @pasblin/versioned-json zod
+```
+
+## Quick start
+
+```ts
+import { z } from 'zod';
+import { createRegistry, defineMigration, defineSchema } from '@pasblin/versioned-json';
+import { zodAdapter } from '@pasblin/versioned-json/zod';
+
+// 1. Describe each historical shape.
+const DocV1 = z.object({ version: z.literal(1), title: z.string() });
+const DocV2 = DocV1.extend({ version: z.literal(2), tags: z.array(z.string()).default([]) });
+
+const schemaV1 = defineSchema({ version: 1, validator: zodAdapter(DocV1) });
+const schemaV2 = defineSchema({
+  version: 2,
+  validator: zodAdapter(DocV2),
+  deprecated: [{ path: 'title', sinceVersion: 2, replacement: 'name' }],
+});
+
+// 2. Migrate v(n) → v(n+1) with explicit defaults.
+const m1to2 = defineMigration({
+  from: 1,
+  to: 2,
+  up: (doc) => ({ ...doc, version: 2 as const, tags: [] }),
+});
+
+// 3. Build the registry once.
+const registry = createRegistry({
+  schemas: [schemaV1, schemaV2],
+  migrations: [m1to2],
+  latest: schemaV2,
+});
+
+// 4. Use it on arbitrary input.
+const result = registry.process({ version: 1, title: 'hello' });
+
+if (result.ok) {
+  result.data; // typed as DocV2
+  result.warnings; // deprecation notices, etc.
+  result.meta; // { detectedVersion, targetVersion, appliedMigrations }
+} else {
+  result.errors; // ValidationIssue[] with severity 'error'
+}
+```
+
+## Registry options
+
+`createRegistry` accepts a small but important set of options. The defaults
+cover the simplest case (`{ version: 1 }` at the top of every document); the
+rest are essential for real adoption.
+
+| Option                | Type                   | Default             | When to use                                                                  |
+| --------------------- | ---------------------- | ------------------- | ---------------------------------------------------------------------------- |
+| `schemas`             | `Schema[]`             | —                   | Required. Every historical version, in any order.                            |
+| `migrations`          | `Migration[]`          | —                   | Required. One per `v(n) → v(n+1)` step.                                      |
+| `latest`              | `Schema<V, TLatest>`   | —                   | Required. Pinpoints the latest schema and lets TS infer the output type.     |
+| `versionField`        | `string`               | `'version'`         | Override when the version key is not the root `version` field.               |
+| `comparator`          | `VersionComparator<V>` | `integerVersion…`   | Use `lexicographicVersionComparator` for string versions like `'1.0.2'`.     |
+| `minSupportedVersion` | `V`                    | smallest registered | Soft-retire old versions; documents below this bound are rejected.           |
+| `assumeVersion`       | `V`                    | _none_              | Treat documents missing the version field as this version (legacy adoption). |
+| `strictSource`        | `boolean`              | `true`              | When `false`, skip validation against the source schema before migrating.    |
+
+### Adopting on existing data (no version field yet)
+
+When you bolt versioning onto a system that already has JSON in production,
+the legacy documents do not carry your new version field. Two flags make this
+bearable:
+
+- **`versionField`** lets you pick a name without colliding with existing
+  domain keys (e.g. `'_schemaVersion'` to avoid clashing with a business
+  `'version'` string already in use).
+- **`assumeVersion`** tells the registry what to do when the field is missing.
+  Set it to the current latest so legacy documents pass through unchanged;
+  every new export writes the field explicitly going forward.
+
+```ts
+export const registry = createRegistry({
+  schemas: [schemaV1, schemaV2, schemaV3, schemaV4],
+  migrations: [m1to2, m2to3, m3to4],
+  latest: schemaV4,
+  versionField: '_schemaVersion', // dedicated key, not your business 'version'
+  assumeVersion: 4, // pre-existing JSONs are treated as v4
+  strictSource: true, // catch malformed legacy shapes early
+});
+```
+
+Bump `assumeVersion` every time you raise `latest`. New exports must always
+write the field explicitly; `assumeVersion` is only a safety net for data
+that predates the field. The write side is a one-liner on top of the
+document:
+
+```ts
+// Whenever your code emits a new document, stamp the latest schema version.
+const doc = {
+  _schemaVersion: 4,
+  // ...your domain payload
+};
+
+fs.writeFileSync('out.json', JSON.stringify(doc, null, 2));
+```
+
+## Validators without Zod
+
+`zodAdapter` is convenient but optional. Any function that returns a
+`ValidationResult` works via `fromValidateFn`. Useful when you want zero
+runtime dependencies, custom error codes, or to wrap an existing JSON
+schema engine.
+
+This is the Quick start, rewritten without Zod — same shape, same
+behaviour:
+
+```ts
+import {
+  createRegistry,
+  defineMigration,
+  defineSchema,
+  fromValidateFn,
+} from '@pasblin/versioned-json';
+
+interface DocV1 {
+  version: 1;
+  title: string;
+}
+interface DocV2 {
+  version: 2;
+  title: string;
+  tags: string[];
+}
+
+// 1. Hand-rolled validators — each returns ValidationResult<T>.
+const validateV1 = fromValidateFn<DocV1>((input) => {
+  if (typeof input !== 'object' || input === null) {
+    return {
+      ok: false,
+      errors: [{ severity: 'error', code: 'NOT_OBJECT', message: 'Expected object', path: '' }],
+      warnings: [],
+    };
+  }
+  const obj = input as Record<string, unknown>;
+  if (obj.version !== 1 || typeof obj.title !== 'string') {
+    return {
+      ok: false,
+      errors: [{ severity: 'error', code: 'INVALID_DOC_V1', message: 'invalid v1 doc', path: '' }],
+      warnings: [],
+    };
+  }
+  return { ok: true, data: { version: 1, title: obj.title }, warnings: [] };
+});
+
+const validateV2 = fromValidateFn<DocV2>((input) => {
+  const obj = input as Record<string, unknown>;
+  if (obj?.version !== 2 || typeof obj.title !== 'string' || !Array.isArray(obj.tags)) {
+    return {
+      ok: false,
+      errors: [{ severity: 'error', code: 'INVALID_DOC_V2', message: 'invalid v2 doc', path: '' }],
+      warnings: [],
+    };
+  }
+  return {
+    ok: true,
+    data: { version: 2, title: obj.title, tags: obj.tags as string[] },
+    warnings: [],
+  };
+});
+
+// 2. Schemas + migration + registry — identical to the Zod Quick start.
+const schemaV1 = defineSchema({ version: 1, validator: validateV1 });
+const schemaV2 = defineSchema({
+  version: 2,
+  validator: validateV2,
+  deprecated: [{ path: 'title', sinceVersion: 2, replacement: 'name' }],
+});
+
+const m1to2 = defineMigration({
+  from: 1,
+  to: 2,
+  up: (doc) => ({ ...doc, version: 2 as const, tags: [] }),
+});
+
+const registry = createRegistry({
+  schemas: [schemaV1, schemaV2],
+  migrations: [m1to2],
+  latest: schemaV2,
+});
+
+// 3. Use it.
+const result = registry.process({ version: 1, title: 'hello' });
+if (result.ok) {
+  console.log(result.data); // { version: 2, title: 'hello', tags: [] }
+}
+```
+
+## Deprecation path syntax
+
+Deprecation `path`s describe where in a document a deprecated value can
+live. The grammar is intentionally tiny:
+
+| Pattern                     | Matches                                                           |
+| --------------------------- | ----------------------------------------------------------------- |
+| `title`                     | The `title` key at the root.                                      |
+| `meta.author.name`          | A nested object key, dot-separated.                               |
+| `tags[0]`                   | The first element of the `tags` array.                            |
+| `items[*].sub.flag`         | The `sub.flag` key on every element of `items`.                   |
+| `parents[*].children[*].id` | A wildcard at every array level — most useful for legacy renames. |
+
+No other operators are supported (no slices, no regex, no conditional
+selectors). If you need them, build the deprecation list dynamically before
+passing it to `defineSchema`.
+
+### What a deprecation warning looks like at runtime
+
+Given this declaration on `schemaV3`:
+
+```ts
+const schemaV3 = defineSchema({
+  version: 3,
+  validator: validateV3,
+  deprecated: [
+    {
+      path: 'parents[*].children[*].oldId',
+      sinceVersion: 3,
+      plannedRemovalVersion: 5,
+      replacement: 'parents[*].children[*].id',
+      reason: 'renamed for clarity',
+    },
+  ],
+});
+```
+
+Processing an input that contains `parents[0].children[1].oldId: 'x'`
+yields one warning per concrete hit (wildcards are expanded against the
+actual data):
+
+```ts
+result.warnings;
+// [
+//   {
+//     severity: 'warning',
+//     code: 'DEPRECATED_FIELD',
+//     path: 'parents[0].children[1].oldId',
+//     message:
+//       'Field "parents[0].children[1].oldId" is deprecated since version 3 ' +
+//       'and is scheduled for removal in version 5; ' +
+//       'use "parents[*].children[*].id" instead (renamed for clarity).',
+//     meta: {
+//       declaredPath: 'parents[*].children[*].oldId',
+//       sinceVersion: 3,
+//       plannedRemovalVersion: 5,
+//       replacement: 'parents[*].children[*].id',
+//       reason: 'renamed for clarity',
+//     },
+//   },
+// ]
+```
+
+Deprecation warnings never block: `result.ok` stays `true` and `result.data`
+holds the migrated document. Use them to drive logging, telemetry or UI hints.
+
+## Real-world example: a recipe document family
+
+The library's own integration test (
+[`src/__tests__/recipe.integration.test.ts`](./src/__tests__/recipe.integration.test.ts)
+) walks a realistic 4-version family. The shape below is condensed but real —
+it is the exact pipeline the test runs against fixtures `v1.json` … `v4.json`.
+
+```ts
+import { readFileSync } from 'node:fs';
+import { z } from 'zod';
+import { createRegistry, defineMigration, defineSchema, ErrorCode } from '@pasblin/versioned-json';
+import { zodAdapter } from '@pasblin/versioned-json/zod';
+
+// --- Per-version Zod shapes (each version extends the previous one) -------
+const StepV1 = z.object({
+  timer: z.object({ active: z.boolean() }),
+  tags: z.array(z.string()),
+});
+const RecipeV1 = z.object({
+  version: z.literal(1),
+  title: z.string(),
+  cuisine: z.string(),
+  year: z.number().int(),
+  type: z.enum(['Main', 'Side']),
+  steps: z.array(StepV1),
+});
+const RecipeV2 = RecipeV1.extend({ version: z.literal(2), notes: z.string().default('NONE') });
+const StepV3 = StepV1.extend({
+  timing: z.object({
+    method: z.string(),
+    minMinutes: z.number().int().positive().optional(),
+    maxMinutes: z.number().int().positive().optional(),
+  }),
+});
+const RecipeV3 = RecipeV2.extend({
+  version: z.literal(3),
+  cookbook: z.string().default('home'),
+  steps: z.array(StepV3),
+});
+const StepV4 = StepV3.extend({ category: z.string() });
+const RecipeV4 = RecipeV3.extend({
+  version: z.literal(4),
+  relatedDishes: z.array(z.string()).default([]),
+  steps: z.array(StepV4),
+});
+
+// --- Schemas -------------------------------------------------------------
+const schemaV1 = defineSchema({ version: 1, validator: zodAdapter(RecipeV1) });
+const schemaV2 = defineSchema({ version: 2, validator: zodAdapter(RecipeV2) });
+const schemaV3 = defineSchema({ version: 3, validator: zodAdapter(RecipeV3) });
+const schemaV4 = defineSchema({
+  version: 4,
+  validator: zodAdapter(RecipeV4),
+  deprecated: [
+    {
+      path: 'steps[*].timing.minMinutes',
+      sinceVersion: 4,
+      plannedRemovalVersion: 6,
+      replacement: 'steps[*].timing.range.min',
+      reason: 'flattened range fields will be grouped under a single object',
+    },
+    {
+      path: 'steps[*].timing.maxMinutes',
+      sinceVersion: 4,
+      plannedRemovalVersion: 6,
+    },
+  ],
+});
+
+// --- Migrations: each one applies its own explicit defaults ---------------
+const m1to2 = defineMigration({
+  from: 1,
+  to: 2,
+  up: (doc) => ({ ...doc, version: 2 as const, notes: 'NONE' }),
+});
+const m2to3 = defineMigration({
+  from: 2,
+  to: 3,
+  up: (doc) => ({
+    ...doc,
+    version: 3 as const,
+    cookbook: 'home',
+    steps: doc.steps.map((s) => ({ ...s, timing: { method: 'manual' } })),
+  }),
+});
+const m3to4 = defineMigration({
+  from: 3,
+  to: 4,
+  up: (doc) => ({
+    ...doc,
+    version: 4 as const,
+    relatedDishes: [],
+    steps: doc.steps.map((s) => ({ ...s, category: 'general' })),
+  }),
+});
+
+export const recipeRegistry = createRegistry({
+  schemas: [schemaV1, schemaV2, schemaV3, schemaV4],
+  migrations: [m1to2, m2to3, m3to4],
+  latest: schemaV4,
+});
+
+// --- Use it ---------------------------------------------------------------
+const legacyV1 = JSON.parse(readFileSync('./legacy-v1.json', 'utf-8')) as unknown;
+const result = recipeRegistry.process(legacyV1);
+
+if (!result.ok) {
+  if (result.errors[0]?.code === ErrorCode.UnsupportedLegacyVersion) {
+    // The version was registered but soft-retired with `minSupportedVersion`.
+    console.warn('Document refers to a retired schema version, refusing.');
+  }
+  throw new Error(`Cannot upgrade document: ${result.errors[0]?.code}`);
+}
+
+result.data; // typed as RecipeV4 — latest, fully validated
+result.meta.appliedMigrations; // [{from:1,to:2}, {from:2,to:3}, {from:3,to:4}]
+result.warnings; // any DEPRECATED_FIELD hits found in the source
+```
+
+The corresponding integration test asserts every step of this pipeline,
+including deprecation warnings on `v3.json` and rejection of legacy `v1.json`
+when `minSupportedVersion: 3` is configured.
+
+## Lifecycle of a version
+
+```
+[introduced] → [active] → [field-deprecated] → [legacy, minSupported bumped] → [retired]
+```
+
+- **Field deprecation**: declare `deprecated: [{ path, sinceVersion, ... }]`
+  on the schema where the field becomes obsolete. The registry emits a
+  `DEPRECATED_FIELD` warning every time it is present in an input.
+- **Version retirement**: when telemetry says no live documents are still on
+  v(n), bump `minSupportedVersion` to `n+1`. Documents declaring v(n) will
+  now be rejected with `UNSUPPORTED_LEGACY_VERSION` instead of being
+  migrated. After a deprecation window, delete the schema, the migration and
+  the fixture files; keep one regression test that asserts the new error.
+
+## API surface
+
+- `defineSchema` / `Schema` — per-version description (validator +
+  optional deprecations).
+- `defineMigration` / `Migration` — pure forward transformation.
+- `createMigrator` — chain executor used internally; exposed for advanced
+  use cases.
+- `createRegistry` / `Registry.process` / `Registry.processOrThrow` —
+  top-level orchestrator.
+- `ValidatorAdapter` + `fromValidateFn` — plug your own validator.
+- `zodAdapter` (sub-export `@pasblin/versioned-json/zod`) — ready-made
+  adapter for Zod schemas.
+- `integerVersionComparator` (default), `lexicographicVersionComparator`,
+  `VersionComparator` — pluggable ordering for version identifiers.
+- `VersionedJsonError`, `ErrorCode`, and the typed subclasses for
+  programmatic branching.
+
+## CLI
+
+The package ships a small `versioned-json` binary for one-off upgrades from
+the shell. It loads a built JS module exposing your `Registry`, processes a
+JSON document and writes the migrated result to stdout or a file.
+
+```bash
+versioned-json upgrade --registry ./registry.js doc.json
+versioned-json upgrade --registry ./registry.js --out upgraded.json --pretty doc.json
+cat doc.json | versioned-json upgrade --registry ./registry.js -
+```
+
+Options:
+
+- `--registry <path>` (required) — path to a built JS module exporting a
+  `Registry` (default export or a named `registry` export).
+- `--out <path>` — write the migrated document to a file; defaults to stdout.
+- `--pretty` — pretty-print the JSON output.
+- `--quiet` — suppress warnings on stderr.
+- `--allow-failed` — exit `0` even when the document fails.
+- `-h`, `--help` — show help.
+
+Exit codes are stable: `0` success, `1` the document failed validation or
+migration, `2` misuse (bad arguments, registry not loadable, etc.).
+
+The `<input>` positional is a file path, or `-` to read JSON from stdin.
+
+## TypeScript and module formats
+
+The package ships both ESM and CJS builds with `.d.ts` declarations:
+
+```ts
+import { createRegistry } from '@pasblin/versioned-json'; // ESM
+const { createRegistry } = require('@pasblin/versioned-json'); // CJS
+```
+
+`zod` is declared as an **optional** peer dependency: only install it if you
+import from `@pasblin/versioned-json/zod`.
+
+## Development
+
+```bash
+# Install dependencies
+npm install
+
+# Run tests in watch mode
+npm run test:watch
+
+# Build the library
+npm run build
+
+# Lint & format
+npm run lint
+npm run format
+```
+
+### Scripts
+
+| Script                    | Description                                                    |
+| ------------------------- | -------------------------------------------------------------- |
+| `build`                   | Build ESM + CJS + d.ts with [`tsup`](https://tsup.egoist.dev/) |
+| `dev`                     | Build in watch mode                                            |
+| `test`                    | Run tests once with [Vitest](https://vitest.dev/)              |
+| `test:watch`              | Tests in watch mode                                            |
+| `test:coverage`           | Tests with coverage                                            |
+| `typecheck`               | Type-check without emitting                                    |
+| `lint` / `lint:fix`       | ESLint                                                         |
+| `format` / `format:check` | Prettier                                                       |
+| `changeset`               | Create a changeset for the next release                        |
+
+### Releasing
+
+This repo uses [Changesets](https://github.com/changesets/changesets):
+
+1. Run `npm run changeset` and describe your change.
+2. Commit and push.
+3. The **Release** GitHub Action opens a "Version Packages" PR.
+4. Merging that PR publishes to npm automatically.
+
+You need to set the secret `NPM_TOKEN` in the repository for publishing.
+
+## License
+
+[MIT](./LICENSE) © pasblin

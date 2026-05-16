@@ -1,0 +1,28 @@
+{
+  "version": 4,
+  "title": "Pumpkin Pie",
+  "cuisine": "american",
+  "year": 2024,
+  "type": "Main",
+  "notes": "BETA",
+  "cookbook": "home",
+  "relatedDishes": [],
+  "steps": [
+    {
+      "timer": { "active": true },
+      "tags": ["prep", "knife"],
+      "timing": {
+        "method": "manual"
+      },
+      "category": "general"
+    },
+    {
+      "timer": { "active": false },
+      "tags": ["plate"],
+      "timing": {
+        "method": "oven"
+      },
+      "category": "general"
+    }
+  ]
+}

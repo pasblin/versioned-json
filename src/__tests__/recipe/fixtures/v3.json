@@ -1,0 +1,27 @@
+{
+  "version": 3,
+  "title": "Sourdough Bread",
+  "cuisine": "european",
+  "year": 2022,
+  "type": "Side",
+  "notes": "BETA",
+  "cookbook": "home",
+  "steps": [
+    {
+      "timer": { "active": true },
+      "tags": ["prep", "knife"],
+      "timing": {
+        "method": "manual",
+        "minMinutes": 10,
+        "maxMinutes": 15
+      }
+    },
+    {
+      "timer": { "active": false },
+      "tags": ["plate"],
+      "timing": {
+        "method": "oven"
+      }
+    }
+  ]
+}

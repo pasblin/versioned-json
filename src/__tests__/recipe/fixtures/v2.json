@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "title": "Tacos al Pastor",
+  "cuisine": "mexican",
+  "year": 2020,
+  "type": "Main",
+  "notes": "BETA",
+  "steps": [
+    {
+      "timer": { "active": true },
+      "tags": ["prep", "knife"]
+    },
+    {
+      "timer": { "active": false },
+      "tags": ["plate"]
+    }
+  ]
+}
