@@ -4,7 +4,8 @@
 [![npm version](https://img.shields.io/npm/v/@pasblin/versioned-json.svg)](https://www.npmjs.com/package/@pasblin/versioned-json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-> Framework-agnostic TypeScript library for versioned JSON.
+> Framework-agnostic lifecycle toolkit for versioned JSON: migrations,
+> deprecations, retirement and pluggable validators.
 
 Works in **any** JavaScript / TypeScript project: Angular, React, Vue, Svelte, Node.js, Deno, Bun, etc.
 
@@ -106,16 +107,19 @@ if (result.ok) {
 cover the simplest case (`{ version: 1 }` at the top of every document); the
 rest are essential for real adoption.
 
-| Option                | Type                   | Default             | When to use                                                                  |
-| --------------------- | ---------------------- | ------------------- | ---------------------------------------------------------------------------- |
-| `schemas`             | `Schema[]`             | —                   | Required. Every historical version, in any order.                            |
-| `migrations`          | `Migration[]`          | —                   | Required. One per `v(n) → v(n+1)` step.                                      |
-| `latest`              | `Schema<V, TLatest>`   | —                   | Required. Pinpoints the latest schema and lets TS infer the output type.     |
-| `versionField`        | `string`               | `'version'`         | Override when the version key is not the root `version` field.               |
-| `comparator`          | `VersionComparator<V>` | `integerVersion…`   | Use `lexicographicVersionComparator` for string versions like `'1.0.2'`.     |
-| `minSupportedVersion` | `V`                    | smallest registered | Soft-retire old versions; documents below this bound are rejected.           |
-| `assumeVersion`       | `V`                    | _none_              | Treat documents missing the version field as this version (legacy adoption). |
-| `strictSource`        | `boolean`              | `true`              | When `false`, skip validation against the source schema before migrating.    |
+| Option                | Type                               | Default             | When to use                                                                  |
+| --------------------- | ---------------------------------- | ------------------- | ---------------------------------------------------------------------------- |
+| `schemas`             | `Schema[]`                         | —                   | Required. Every historical version, in any order.                            |
+| `migrations`          | `Migration[]`                      | —                   | Required. One per `v(n) → v(n+1)` step.                                      |
+| `latest`              | `Schema<V, TLatest>`               | —                   | Required. Pinpoints the latest schema and lets TS infer the output type.     |
+| `versionField`        | `string`                           | `'version'`         | Override when the version key is not the root `version` field.               |
+| `resolveVersion`      | `(input) => V \| undefined`        | _none_              | Pluggable detection strategy when the version is not at the root.            |
+| `comparator`          | `VersionComparator<V>`             | `integerVersion…`   | Use `lexicographicVersionComparator` for string versions like `'1.0.2'`.     |
+| `minSupportedVersion` | `V`                                | smallest registered | Soft-retire old versions; documents below this bound are rejected.           |
+| `assumeVersion`       | `V`                                | _none_              | Treat documents missing the version field as this version (legacy adoption). |
+| `strictSource`        | `boolean`                          | `true`              | When `false`, skip validation against the source schema before migrating.    |
+| `onMigration`         | `(step: AppliedMigration) => void` | _none_              | Observability hook fired once per applied migration step.                    |
+| `onDeprecation`       | `(issue: ValidationIssue) => void` | _none_              | Observability hook fired once per deprecation warning emitted.               |
 
 ### Adopting on existing data (no version field yet)
 
@@ -155,6 +159,71 @@ const doc = {
 
 fs.writeFileSync('out.json', JSON.stringify(doc, null, 2));
 ```
+
+## Custom version detection
+
+When the version is not at the root or follows a non-trivial encoding —
+nested under `meta.schemaVersion`, encoded in a `$schema` URL, derived from
+the document content, or supplied by an external source (filename, HTTP
+header) — pass a `resolveVersion(input)` function. It overrides
+`versionField` and gives you full control:
+
+```ts
+createRegistry({
+  schemas: [schemaV1, schemaV2, schemaV3, schemaV4],
+  migrations: [m1to2, m2to3, m3to4],
+  latest: schemaV4,
+  resolveVersion: (input) => {
+    if (typeof input !== 'object' || input === null) return undefined;
+    const obj = input as { meta?: { schemaVersion?: number } };
+    return obj.meta?.schemaVersion;
+  },
+  assumeVersion: 4, // applies when resolveVersion returns undefined
+});
+```
+
+Semantics:
+
+- Return any version value: the registry validates it through the
+  comparator and rejects unsupported values with `UNKNOWN_VERSION`.
+- Return `undefined`: the registry falls back to `assumeVersion` if
+  configured, otherwise emits `MISSING_VERSION`.
+- The function must be pure (same input ⇒ same output, no side effects);
+  thrown errors propagate.
+
+## Observability hooks
+
+Two optional hooks let you stream pipeline events into your logger,
+metrics, or telemetry without iterating `result.warnings` and
+`result.meta.appliedMigrations` yourself:
+
+```ts
+import type { AppliedMigration, ValidationIssue } from '@pasblin/versioned-json';
+
+createRegistry({
+  schemas: [schemaV1, schemaV2, schemaV3, schemaV4],
+  migrations: [m1to2, m2to3, m3to4],
+  latest: schemaV4,
+  onMigration: (step: AppliedMigration) => {
+    metrics.increment('versioned_json.migration', { from: step.from, to: step.to });
+  },
+  onDeprecation: (issue: ValidationIssue) => {
+    logger.warn('[deprecation]', issue.code, issue.path, issue.message);
+  },
+});
+```
+
+Semantics:
+
+- `onMigration` fires once per applied step, in pipeline order, only
+  after the full migration succeeds. It is not called when the source
+  document is already at `latest`.
+- `onDeprecation` fires once per warning emitted by either the source
+  schema (during the source-document walk) or the latest schema (during
+  the post-migration walk).
+- Hooks must not throw; thrown errors propagate and abort `process(...)`.
+  Wrap with `try/catch` in user code if you need at-most-once-delivery
+  semantics.
 
 ## Validators without Zod
 
@@ -459,7 +528,10 @@ when `minSupportedVersion: 3` is configured.
 - `createMigrator` — chain executor used internally; exposed for advanced
   use cases.
 - `createRegistry` / `Registry.process` / `Registry.processOrThrow` —
-  top-level orchestrator.
+  top-level orchestrator. Configurable detection (`versionField`,
+  `resolveVersion`), retirement (`minSupportedVersion`), legacy adoption
+  (`assumeVersion`), and observability hooks (`onMigration`,
+  `onDeprecation`).
 - `ValidatorAdapter` + `fromValidateFn` — plug your own validator.
 - `zodAdapter` (sub-export `@pasblin/versioned-json/zod`) — ready-made
   adapter for Zod schemas.
