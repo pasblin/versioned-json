@@ -9,15 +9,20 @@
  *
  * Pipeline of {@link Registry.process | process(input)}:
  *
- * 1. Read the version field from `input` (or fall back to `assumeVersion`).
+ * 1. Detect the version via `resolveVersion(input)` if provided, else read
+ *    the configured `versionField` from `input`. Fall back to `assumeVersion`
+ *    when nothing matches.
  * 2. Gate the detected version against `minSupportedVersion` and `latest`.
  * 3. (optional) Validate the input against its source schema (`strictSource`).
  * 4. Walk the source schema's deprecations on the source document so that
  *    deprecated fields are reported even if a later migration removes or
  *    renames them. Skipped when source equals latest to avoid duplicates.
+ *    The optional `onDeprecation` hook fires once per warning produced here.
  * 5. Run the migrator from the detected version up to `latest`.
- * 6. Validate the migrated document against the latest schema.
- * 7. Collect deprecation warnings on the validated latest document.
+ * 6. Validate the migrated document against the latest schema. The optional
+ *    `onMigration` hook fires once per applied step, in pipeline order.
+ * 7. Collect deprecation warnings on the validated latest document, firing
+ *    `onDeprecation` once per warning.
  *
  * Every recoverable failure is surfaced as a {@link ValidationIssue} on the
  * returned {@link ProcessResult}; only programmer mistakes (missing
@@ -37,7 +42,7 @@ import {
 import { invariant } from '../core/invariant.js';
 import type { ProcessResult, ValidationIssue, Version } from '../core/types.js';
 import { integerVersionComparator, type VersionComparator } from '../core/versionComparator.js';
-import { createMigrator, type AnyMigration } from '../migration/migrator.js';
+import { createMigrator, type AnyMigration, type AppliedMigration } from '../migration/migrator.js';
 import { collectDeprecationWarnings } from '../schema/deprecationWalker.js';
 import type { Schema } from '../schema/schema.js';
 
@@ -92,8 +97,43 @@ export interface RegistryConfig<V extends Version, TLatest> {
   /**
    * Property name on the raw JSON that carries the version. Defaults to
    * `'version'`.
+   *
+   * Ignored when {@link RegistryConfig.resolveVersion | resolveVersion} is
+   * also provided.
    */
   readonly versionField?: string;
+
+  /**
+   * Pluggable strategy to extract the version from a raw input. When provided,
+   * it takes precedence over {@link RegistryConfig.versionField | versionField}
+   * and gives full control over how the version is detected.
+   *
+   * Useful when the version lives in a non-root location (e.g. `meta.schema`),
+   * is encoded in a `$schema` URL, must be derived from the document content,
+   * or is supplied externally (filename, HTTP header, etc.).
+   *
+   * Return `undefined` to signal "no version detected" — the registry then
+   * falls back to {@link RegistryConfig.assumeVersion | assumeVersion} or
+   * surfaces a `MISSING_VERSION` error.
+   *
+   * Return any other value to mean "this is the version"; the registry
+   * validates it through the comparator and rejects unsupported values with
+   * `UNKNOWN_VERSION`.
+   *
+   * The function must be pure: same input ⇒ same output, no side effects.
+   *
+   * @example
+   * ```ts
+   * createRegistry({
+   *   // ...
+   *   resolveVersion: (input) => {
+   *     if (typeof input !== 'object' || input === null) return undefined;
+   *     return (input as { meta?: { schemaVersion?: number } }).meta?.schemaVersion;
+   *   },
+   * });
+   * ```
+   */
+  readonly resolveVersion?: (input: unknown) => V | undefined;
 
   /**
    * Minimum version still accepted by the registry. Defaults to the smallest
@@ -121,6 +161,34 @@ export interface RegistryConfig<V extends Version, TLatest> {
    * legacy documents earlier.
    */
   readonly strictSource?: boolean;
+
+  /**
+   * Observability hook. Invoked once per migration step actually applied,
+   * in pipeline order, *after* the migrator finishes successfully.
+   *
+   * Use it to wire migration traces into your logger, metrics, or telemetry
+   * pipeline. The hook is non-blocking and its return value is ignored;
+   * it is *not* called when no migration is applied (source already at
+   * `latest`) or when migration fails.
+   *
+   * The hook should not throw. Thrown errors propagate and abort
+   * `process(...)` — wrap with try/catch in user code if needed.
+   */
+  readonly onMigration?: (step: AppliedMigration) => void;
+
+  /**
+   * Observability hook. Invoked once per deprecation warning emitted,
+   * including warnings produced by the source-schema walk and the
+   * latest-schema walk.
+   *
+   * Use it to surface deprecations in real time (e.g. send to Sentry,
+   * write a structured log line) without iterating `result.warnings`
+   * yourself.
+   *
+   * The hook should not throw. Thrown errors propagate and abort
+   * `process(...)` — wrap with try/catch in user code if needed.
+   */
+  readonly onDeprecation?: (issue: ValidationIssue) => void;
 }
 
 /**
@@ -290,6 +358,37 @@ export const createRegistry = <V extends Version, TLatest>(
   ):
     | { readonly ok: true; readonly version: V }
     | { readonly ok: false; readonly issue: ValidationIssue } => {
+    // Strategy 1: user-supplied resolveVersion takes precedence.
+    if (config.resolveVersion !== undefined) {
+      const resolved = config.resolveVersion(input);
+      if (resolved === undefined) {
+        if (config.assumeVersion !== undefined) {
+          return { ok: true, version: config.assumeVersion };
+        }
+        return {
+          ok: false,
+          issue: issue(
+            'error',
+            ErrorCode.MissingVersion,
+            'resolveVersion returned undefined and no assumeVersion is configured.',
+          ),
+        };
+      }
+      if (!comparator.isVersion(resolved)) {
+        return {
+          ok: false,
+          issue: issue(
+            'error',
+            ErrorCode.UnknownVersion,
+            `resolveVersion returned an unsupported value: ${JSON.stringify(resolved)}.`,
+            { rawValue: resolved },
+          ),
+        };
+      }
+      return { ok: true, version: resolved };
+    }
+
+    // Strategy 2: read the configured (or default) version field on the root.
     if (!isPlainObject(input)) {
       if (config.assumeVersion !== undefined) {
         return { ok: true, version: config.assumeVersion };
@@ -429,6 +528,11 @@ export const createRegistry = <V extends Version, TLatest>(
         sourceSchema.deprecated,
       );
       warnings.push(...sourceDeprecationWarnings);
+      if (config.onDeprecation !== undefined) {
+        for (const w of sourceDeprecationWarnings) {
+          config.onDeprecation(w);
+        }
+      }
     }
 
     let migrated;
@@ -473,11 +577,24 @@ export const createRegistry = <V extends Version, TLatest>(
       };
     }
 
+    // Migration succeeded and the latest document is structurally valid.
+    // Notify observers, in pipeline order, before reporting deprecations.
+    if (config.onMigration !== undefined) {
+      for (const step of migrated.applied) {
+        config.onMigration(step);
+      }
+    }
+
     const deprecationWarnings = collectDeprecationWarnings(
       latestResult.data,
       latestSchema.deprecated,
     );
     warnings.push(...deprecationWarnings);
+    if (config.onDeprecation !== undefined) {
+      for (const w of deprecationWarnings) {
+        config.onDeprecation(w);
+      }
+    }
 
     return {
       ok: true,

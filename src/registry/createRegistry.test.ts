@@ -557,3 +557,186 @@ describe('createRegistry – processOrThrow', () => {
     expect(() => registry.processOrThrow({ title: 'no version' })).toThrow(ValidationFailedError);
   });
 });
+
+describe('createRegistry – resolveVersion', () => {
+  it('uses the resolver result and ignores versionField', () => {
+    const registry = createRegistry({
+      schemas: [schemaV1, schemaV2, schemaV3],
+      migrations: [m1to2, m2to3],
+      latest: schemaV3,
+      versionField: 'ignored', // intentionally wrong, must be ignored
+      resolveVersion: (input) => {
+        if (typeof input !== 'object' || input === null) return undefined;
+        return (input as { meta?: { v?: number } }).meta?.v;
+      },
+    });
+
+    const result = registry.process({ meta: { v: 1 }, title: 't' });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.meta.detectedVersion).toBe(1);
+    expect(result.meta.appliedMigrations.length).toBe(2);
+  });
+
+  it('falls back to assumeVersion when resolver returns undefined', () => {
+    const registry = createRegistry({
+      schemas: [schemaV1, schemaV2, schemaV3],
+      migrations: [m1to2, m2to3],
+      latest: schemaV3,
+      assumeVersion: 3,
+      resolveVersion: () => undefined,
+    });
+
+    const result = registry.process({ title: 't' });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.meta.detectedVersion).toBe(3);
+    expect(result.meta.appliedMigrations).toEqual([]);
+  });
+
+  it('emits MissingVersion when resolver returns undefined and no assumeVersion is set', () => {
+    const registry = createRegistry({
+      schemas: [schemaV1, schemaV2, schemaV3],
+      migrations: [m1to2, m2to3],
+      latest: schemaV3,
+      resolveVersion: () => undefined,
+    });
+
+    const result = registry.process({ title: 't' });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors[0]?.code).toBe(ErrorCode.MissingVersion);
+    expect(result.errors[0]?.message).toContain('resolveVersion');
+  });
+
+  it('emits UnknownVersion when resolver returns an unsupported value', () => {
+    const registry = createRegistry({
+      schemas: [schemaV1, schemaV2, schemaV3],
+      migrations: [m1to2, m2to3],
+      latest: schemaV3,
+      // The integer comparator rejects the string "banana" via isVersion.
+      resolveVersion: () => 'banana' as unknown as 1 | 2 | 3,
+    });
+
+    const result = registry.process({});
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors[0]?.code).toBe(ErrorCode.UnknownVersion);
+    expect(result.errors[0]?.message).toContain('resolveVersion');
+  });
+
+  it('receives the original input including non-object values', () => {
+    const seen: unknown[] = [];
+    const registry = createRegistry({
+      schemas: [schemaV1, schemaV2, schemaV3],
+      migrations: [m1to2, m2to3],
+      latest: schemaV3,
+      assumeVersion: 3,
+      resolveVersion: (input) => {
+        seen.push(input);
+        return undefined;
+      },
+    });
+
+    registry.process('not-an-object');
+    registry.process(null);
+    registry.process({ foo: 1 });
+
+    expect(seen).toEqual(['not-an-object', null, { foo: 1 }]);
+  });
+});
+
+describe('createRegistry – observability hooks', () => {
+  it('calls onMigration once per applied step, in pipeline order', () => {
+    const steps: { from: unknown; to: unknown }[] = [];
+    const registry = createRegistry({
+      schemas: [schemaV1, schemaV2, schemaV3],
+      migrations: [m1to2, m2to3],
+      latest: schemaV3,
+      onMigration: (step) => steps.push({ from: step.from, to: step.to }),
+    });
+
+    const result = registry.process({ version: 1, title: 't' });
+    expect(result.ok).toBe(true);
+    expect(steps).toEqual([
+      { from: 1, to: 2 },
+      { from: 2, to: 3 },
+    ]);
+  });
+
+  it('does not call onMigration when source equals latest', () => {
+    let calls = 0;
+    const registry = createRegistry({
+      schemas: [schemaV1, schemaV2, schemaV3],
+      migrations: [m1to2, m2to3],
+      latest: schemaV3,
+      onMigration: () => {
+        calls += 1;
+      },
+    });
+
+    const result = registry.process({ version: 3, title: 't', tags: [], status: 'draft' });
+    expect(result.ok).toBe(true);
+    expect(calls).toBe(0);
+  });
+
+  it('calls onDeprecation for each warning emitted by the latest schema', () => {
+    const codes: string[] = [];
+    const registry = createRegistry({
+      schemas: [schemaV1, schemaV2, schemaV3],
+      migrations: [m1to2, m2to3],
+      latest: schemaV3,
+      onDeprecation: (issue) => codes.push(issue.code),
+    });
+
+    const result = registry.process({ version: 1, title: 'has-deprecated-title' });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // schemaV3 marks `title` as deprecated; one hit on the latest doc.
+    expect(codes).toEqual(['DEPRECATED_FIELD']);
+  });
+
+  it('calls onDeprecation for source-schema warnings even when migrations remove the field', () => {
+    // Source schema flags `legacyOnly`; the migration drops it. Without the
+    // source-schema walk this warning would be lost; with the walk it fires
+    // and the hook is notified.
+    const schemaV1WithDep = defineSchema<1, DocV1>({
+      version: 1,
+      validator: passThrough<DocV1>(),
+      deprecated: [{ path: 'legacyOnly', sinceVersion: 1 }],
+    });
+    const m1to2Drops = defineMigration({
+      from: 1,
+      to: 2,
+      up: (d: DocV1 & { legacyOnly?: unknown }): DocV2 => {
+        const { legacyOnly: _legacyOnly, ...rest } = d;
+        return { ...rest, version: 2, tags: [] };
+      },
+    });
+
+    const codes: string[] = [];
+    const paths: string[] = [];
+    const registry = createRegistry({
+      schemas: [schemaV1WithDep, schemaV2, schemaV3],
+      migrations: [m1to2Drops, m2to3],
+      latest: schemaV3,
+      onDeprecation: (issue) => {
+        codes.push(issue.code);
+        paths.push(issue.path);
+      },
+    });
+
+    const result = registry.process({ version: 1, title: 't', legacyOnly: 'x' });
+    expect(result.ok).toBe(true);
+    expect(codes).toContain('DEPRECATED_FIELD');
+    expect(paths).toContain('legacyOnly');
+  });
+
+  it('does not call hooks when none are configured (default behaviour)', () => {
+    // Smoke test: a registry with no hooks must still process documents
+    // correctly (covered by other tests, asserted here for clarity).
+    const registry = buildRegistry();
+    const result = registry.process({ version: 1, title: 't' });
+    expect(result.ok).toBe(true);
+  });
+});
