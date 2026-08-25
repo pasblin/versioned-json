@@ -92,3 +92,9 @@ export const zodAdapter = <T>(schema: ZodType<T>): ValidatorAdapter<T> => ({
     };
   },
 });
+
+export {
+  assertWriterExact,
+  collectUndeclaredPaths,
+  WriterExactnessError,
+} from './writerExactness.js';

@@ -348,6 +348,71 @@ payload at a boundary). The Quick start and recipe examples in this README
 use strict objects for brevity; on real long-lived documents, prefer loose
 ones.
 
+## Writer exactness: tolerant reader, exact writer
+
+Loose schemas fix the READ side: unknown keys survive because they may belong
+to a newer era of the document. The flip side is a blind spot on the WRITE
+side — validation can never notice when your own code starts emitting a field
+that **no schema version declares**, which is precisely the mistake of adding
+a field to an export without creating a new schema version plus a migration.
+The `@pasblin/versioned-json/zod` sub-entry ships the guard for that:
+
+```ts
+import { assertWriterExact, collectUndeclaredPaths } from '@pasblin/versioned-json/zod';
+
+// Paths of every key present in `value` but not declared by `schema`.
+// [] === the writer is exact.
+collectUndeclaredPaths(RecipeV4, doc);
+// e.g. ['steps[2].newField']
+
+// Throws WriterExactnessError when a document about to be serialized
+// carries undeclared keys; pass your framework's dev flag to make it a
+// production no-op.
+assertWriterExact(RecipeV4, doc, 'recipe export', isDevMode());
+fs.writeFileSync(path, JSON.stringify(doc, null, 2));
+```
+
+Semantics worth knowing:
+
+- **Tolerance is not declaration**: a loose object's implicit `unknown`
+  catchall does NOT declare keys — its extra keys are still reported. A
+  substantive `.catchall(schema)` DOES declare every key it matches.
+- `optional`/`nullable`/`default`/`readonly`/`catch` wrappers unwrap to the
+  carrier schema; arrays recurse per element with indexed paths;
+  discriminated unions match the variant by tag and recurse inside it (an
+  unmatched tag stays silent — validation owns that failure).
+- Keys under `z.unknown()`/`z.any()`/`z.record(...)` produce no findings,
+  and `undefined`-valued keys are skipped — the guard judges the file that
+  will exist, not the in-memory object.
+- The walker only ever answers "any undeclared keys?", never "is it valid?"
+  — zero overlap with `process()`.
+
+Wire the assert at your serialization points, and pair it with a CI contract
+spec so the mistake is caught twice — in the running dev app and in the
+pipeline:
+
+```ts
+it('all export fixtures are writer-exact', () => {
+  for (const fixture of exportFixtures) {
+    expect(collectUndeclaredPaths(RecipeV4, fixture)).toEqual([]);
+  }
+});
+```
+
+One companion hazard the walker cannot catch (declared key — it checks keys,
+not values): `{ _schemaVersion: N, ...doc }` lets a stale input marker win
+the spread. Stamp by dropping any input marker first, so the output always
+carries the current version:
+
+```ts
+const { _schemaVersion: _stale, ...payload } = doc;
+const out = { _schemaVersion: registry.latest, ...payload };
+```
+
+Loose schemas for reading + writer exactness for writing is Postel's law
+operationalized: be liberal in what you accept, conservative in what you
+emit.
+
 ## Validators without Zod
 
 `zodAdapter` is convenient but optional. Any function that returns a
@@ -658,6 +723,9 @@ when `minSupportedVersion: 3` is configured.
 - `ValidatorAdapter` + `fromValidateFn` — plug your own validator.
 - `zodAdapter` (sub-export `@pasblin/versioned-json/zod`) — ready-made
   adapter for Zod schemas.
+- `collectUndeclaredPaths` / `assertWriterExact` / `WriterExactnessError`
+  (same `/zod` sub-export) — writer-exactness guard for serialization
+  points.
 - `integerVersionComparator` (default), `lexicographicVersionComparator`,
   `VersionComparator` — pluggable ordering for version identifiers.
 - `VersionedJsonError`, `ErrorCode`, and the typed subclasses for
