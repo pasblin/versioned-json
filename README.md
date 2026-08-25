@@ -101,6 +101,45 @@ if (result.ok) {
 }
 ```
 
+## Migration output must satisfy the latest schema
+
+`registry.process()` re-validates the migrated document against the **latest**
+schema after the migration chain runs. This is what guarantees policy #5 —
+"the internal model is always the latest version" — but it has a subtle
+consequence: **a later schema can never demand more than earlier data
+provides unless a migration normalizes the data.**
+
+If you tighten a schema between versions (add a required field, narrow a
+type) without touching the corresponding migration, legacy documents will
+fail validation _after_ migrating — and nothing about the input was wrong.
+The fix belongs in the migration:
+
+```ts
+const V1 = z.object({ version: z.literal(1), title: z.string() });
+// v2 tightens the contract: `id` is now required (nullable, but present).
+const V2 = z.object({ version: z.literal(2), title: z.string(), id: z.number().nullable() });
+
+// BROKEN: forgets to materialize `id`. process() on a v1 document returns
+// ok: false — v2 validation fails on the MIGRATED output, not on the input.
+const broken = defineMigration({
+  from: 1,
+  to: 2,
+  up: (doc) => ({ ...doc, version: 2 as const }),
+});
+
+// FIXED: the new field ships with an explicit default (project policy #3).
+const fixed = defineMigration({
+  from: 1,
+  to: 2,
+  up: (doc) => ({ ...doc, version: 2 as const, id: null }),
+});
+```
+
+Rule of thumb: **tightening a schema between versions is migration work, not
+schema work.** Every `up` must return a document that fully satisfies its
+target version's schema, so the chain's final output is valid against
+`latest`.
+
 ## Registry options
 
 `createRegistry` accepts a small but important set of options. The defaults

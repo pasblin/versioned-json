@@ -40,6 +40,12 @@ export interface Migration<
    * dependent behaviour. Receives the validated document at version `from`
    * and returns the document at version `to` with all new fields filled in
    * with explicit defaults.
+   *
+   * The registry validates the final output of the migration chain against
+   * the latest schema, so `up` must produce a document that fully satisfies
+   * version `to` — tightening a schema between versions (new required field,
+   * narrowed type) is migration work: an `up` that under-delivers surfaces
+   * as a validation failure on the migrated output.
    */
   readonly up: (doc: TFrom) => TTo;
   /**
