@@ -30,6 +30,7 @@ export const ErrorCode = {
   UnsupportedLegacyVersion: 'UNSUPPORTED_LEGACY_VERSION',
   MigrationGap: 'MIGRATION_GAP',
   MigrationFailed: 'MIGRATION_FAILED',
+  MigrationOutputInvalid: 'MIGRATION_OUTPUT_INVALID',
   ValidationFailed: 'VALIDATION_FAILED',
   InvalidRegistry: 'INVALID_REGISTRY',
 } as const;

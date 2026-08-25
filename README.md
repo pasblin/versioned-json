@@ -145,6 +145,23 @@ schema work.** Every `up` must return a document that fully satisfies its
 target version's schema, so the chain's final output is valid against
 `latest`.
 
+This failure mode is programmatically distinguishable: when the migrated
+output fails latest-schema validation, `result.errors` starts with a
+synthetic `MIGRATION_OUTPUT_INVALID` issue that points at the migration
+chain as the fix site, and every issue emitted by a schema validator carries
+a `stage` discriminator — `'source'` (the input document is the problem) or
+`'migrated'` (a migration under-delivered):
+
+```ts
+if (!result.ok) {
+  if (result.errors.some((e) => e.stage === 'migrated')) {
+    // The input was fine — a migration must normalize the reported fields.
+  } else {
+    // The input document itself is invalid.
+  }
+}
+```
+
 ## Registry options
 
 `createRegistry` accepts a small but important set of options. The defaults

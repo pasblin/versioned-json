@@ -517,7 +517,10 @@ describe('createRegistry – process error branches', () => {
     const result = registry.process({ version: 1, title: 't' });
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.errors[0]?.message).toBe('bad v3');
+    // errors[0] is the synthetic MIGRATION_OUTPUT_INVALID summary; the
+    // validator's own issues follow it.
+    expect(result.errors[0]?.code).toBe(ErrorCode.MigrationOutputInvalid);
+    expect(result.errors[1]?.message).toBe('bad v3');
     expect(result.meta.appliedMigrations).toEqual([
       { from: 1, to: 2 },
       { from: 2, to: 3 },
@@ -738,5 +741,110 @@ describe('createRegistry – observability hooks', () => {
     const registry = buildRegistry();
     const result = registry.process({ version: 1, title: 't' });
     expect(result.ok).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('createRegistry – validation stage discrimination', () => {
+  const rejectingV3 = defineSchema<3, DocV3>({
+    version: 3,
+    validator: rejecting<DocV3>('migration under-delivered'),
+  });
+  const buildRejectingLatestRegistry = (strictSource?: boolean) =>
+    createRegistry({
+      schemas: [schemaV1, schemaV2, rejectingV3],
+      migrations: [m1to2, m2to3],
+      latest: rejectingV3,
+      ...(strictSource === undefined ? {} : { strictSource }),
+    });
+
+  it('tags source-validation errors with stage "source"', () => {
+    const rejectingV1 = defineSchema<1, DocV1>({
+      version: 1,
+      validator: rejecting<DocV1>('bad source'),
+    });
+    const registry = createRegistry({
+      schemas: [rejectingV1, schemaV2, schemaV3],
+      migrations: [m1to2, m2to3],
+      latest: schemaV3,
+    });
+
+    const result = registry.process({ version: 1, title: 't' });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]?.stage).toBe('source');
+    expect(result.errors.map((e) => e.code)).not.toContain(ErrorCode.MigrationOutputInvalid);
+  });
+
+  it('prefixes migration-output failures with MIGRATION_OUTPUT_INVALID tagged "migrated"', () => {
+    const registry = buildRejectingLatestRegistry();
+
+    const result = registry.process({ version: 1, title: 't' });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+
+    const [summary, ...rest] = result.errors;
+    expect(summary?.code).toBe(ErrorCode.MigrationOutputInvalid);
+    expect(summary?.severity).toBe('error');
+    expect(summary?.stage).toBe('migrated');
+    expect(summary?.message).toContain('migration');
+    expect(summary?.meta).toMatchObject({ detectedVersion: 1, targetVersion: 3 });
+
+    expect(rest).toHaveLength(1);
+    expect(rest[0]?.code).toBe('BAD');
+    expect(rest[0]?.stage).toBe('migrated');
+  });
+
+  it('treats a latest-validation failure without applied migrations as a source failure', () => {
+    // strictSource: false skips the source check, so the latest validation is
+    // the first (and only) validation the input sees. With no migration
+    // applied, the failure is an input problem, not a migration problem.
+    const registry = buildRejectingLatestRegistry(false);
+
+    const result = registry.process({ version: 3, title: 't', tags: [], status: 'draft' });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.map((e) => e.code)).not.toContain(ErrorCode.MigrationOutputInvalid);
+    expect(result.errors[0]?.stage).toBe('source');
+  });
+
+  it('leaves non-validation issues (version detection, deprecations) unstaged', () => {
+    const missingVersion = buildRegistry().process({ title: 'no version field' });
+    expect(missingVersion.ok).toBe(false);
+    if (missingVersion.ok) return;
+    expect(missingVersion.errors[0]?.code).toBe(ErrorCode.MissingVersion);
+    expect(missingVersion.errors[0]?.stage).toBeUndefined();
+
+    const deprecated = buildRegistry().process({ version: 1, title: 't' });
+    expect(deprecated.ok).toBe(true);
+    if (!deprecated.ok) return;
+    const deprecationWarning = deprecated.warnings.find((w) => w.code === 'DEPRECATED_FIELD');
+    expect(deprecationWarning).toBeDefined();
+    expect(deprecationWarning?.stage).toBeUndefined();
+  });
+
+  it('tags validator warnings with the stage that produced them', () => {
+    const warningValidator = <T>(code: string): ValidatorAdapter<T> =>
+      fromValidateFn<T>((input) => ({
+        ok: true,
+        data: input as T,
+        warnings: [{ severity: 'warning', code, message: 'soft warning', path: '' }],
+      }));
+
+    const warnV1 = defineSchema<1, DocV1>({ version: 1, validator: warningValidator('SOFT_V1') });
+    const warnV3 = defineSchema<3, DocV3>({ version: 3, validator: warningValidator('SOFT_V3') });
+    const registry = createRegistry({
+      schemas: [warnV1, schemaV2, warnV3],
+      migrations: [m1to2, m2to3],
+      latest: warnV3,
+    });
+
+    const result = registry.process({ version: 1, title: 't' });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.warnings.find((w) => w.code === 'SOFT_V1')?.stage).toBe('source');
+    expect(result.warnings.find((w) => w.code === 'SOFT_V3')?.stage).toBe('migrated');
   });
 });

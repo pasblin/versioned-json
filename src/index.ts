@@ -15,6 +15,7 @@ export type {
   ProcessResult,
   ValidationIssue,
   ValidationResult,
+  ValidationStage,
   Version,
 } from './core/types.js';
 

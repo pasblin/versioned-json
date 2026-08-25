@@ -26,6 +26,18 @@ export type Version = number | string;
 export type IssueSeverity = 'error' | 'warning';
 
 /**
+ * Pipeline stage that produced a validation issue.
+ *
+ * - `source`: the issue refers to the input document as supplied — the fix
+ *   belongs in the document (or in the code that wrote it).
+ * - `migrated`: the issue refers to the output of the migration chain — the
+ *   input was accepted, so the fix belongs in a migration.
+ *
+ * @public
+ */
+export type ValidationStage = 'source' | 'migrated';
+
+/**
  * A single piece of feedback produced by a validator or by the migration
  * pipeline. Issues are data, not exceptions: they are returned inside
  * {@link ProcessResult} so callers can render them without `try/catch`.
@@ -52,6 +64,13 @@ export interface ValidationIssue {
   readonly path: string;
   /** Optional structured payload for tooling. Must be JSON-serialisable. */
   readonly meta?: Readonly<Record<string, unknown>>;
+  /**
+   * Pipeline stage that produced this issue. Stamped by the registry on every
+   * issue emitted by a schema validator; absent on issues that are not tied
+   * to a validation stage (version detection, migration failures, deprecation
+   * warnings) and on issues produced outside a registry run.
+   */
+  readonly stage?: ValidationStage;
 }
 
 /**

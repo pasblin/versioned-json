@@ -40,7 +40,7 @@ import {
   VersionedJsonError,
 } from '../core/errors.js';
 import { invariant } from '../core/invariant.js';
-import type { ProcessResult, ValidationIssue, Version } from '../core/types.js';
+import type { ProcessResult, ValidationIssue, ValidationStage, Version } from '../core/types.js';
 import { integerVersionComparator, type VersionComparator } from '../core/versionComparator.js';
 import { createMigrator, type AnyMigration, type AppliedMigration } from '../migration/migrator.js';
 import { collectDeprecationWarnings } from '../schema/deprecationWalker.js';
@@ -227,6 +227,11 @@ const issue = (
   meta === undefined
     ? { severity, code, message, path: '' }
     : { severity, code, message, path: '', meta };
+
+const withStage = (
+  issues: readonly ValidationIssue[],
+  stage: ValidationStage,
+): readonly ValidationIssue[] => issues.map((i) => ({ ...i, stage }));
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -505,11 +510,11 @@ export const createRegistry = <V extends Version, TLatest>(
 
     if (strictSource) {
       const sourceResult = sourceSchema.validator.validate(input);
-      warnings.push(...sourceResult.warnings);
+      warnings.push(...withStage(sourceResult.warnings, 'source'));
       if (!sourceResult.ok) {
         return {
           ok: false,
-          errors: sourceResult.errors,
+          errors: withStage(sourceResult.errors, 'source'),
           warnings,
           meta: { detectedVersion, targetVersion: latestVersion },
         };
@@ -562,12 +567,39 @@ export const createRegistry = <V extends Version, TLatest>(
       throw e;
     }
 
+    // When at least one migration ran, the document being validated is the
+    // chain's output, not the caller's input: a failure there means a
+    // migration under-delivered, and the issues are staged accordingly.
+    const latestStage: ValidationStage = migrated.applied.length > 0 ? 'migrated' : 'source';
+
     const latestResult = latestSchema.validator.validate(migrated.data);
-    warnings.push(...latestResult.warnings);
+    warnings.push(...withStage(latestResult.warnings, latestStage));
     if (!latestResult.ok) {
+      const staged = withStage(latestResult.errors, latestStage);
+      const errors =
+        latestStage === 'migrated'
+          ? [
+              {
+                severity: 'error' as const,
+                code: ErrorCode.MigrationOutputInvalid,
+                message:
+                  `Migrated output (${String(detectedVersion)} → ${String(latestVersion)}) ` +
+                  'failed validation against the latest schema; the migration chain must ' +
+                  'normalize the reported fields — fix the migration, not the input document.',
+                path: '',
+                stage: 'migrated' as const,
+                meta: Object.freeze({
+                  detectedVersion,
+                  targetVersion: latestVersion,
+                  appliedMigrations: migrated.applied,
+                }),
+              },
+              ...staged,
+            ]
+          : staged;
       return {
         ok: false,
-        errors: latestResult.errors,
+        errors,
         warnings,
         meta: {
           detectedVersion,
