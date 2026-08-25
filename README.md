@@ -101,6 +101,11 @@ if (result.ok) {
 }
 ```
 
+> **Note:** the examples use plain `z.object`, which silently strips keys the
+> schema does not declare. For long-lived documents prefer loose objects —
+> see
+> [Zod schemas: strict objects silently strip unknown keys](#zod-schemas-strict-objects-silently-strip-unknown-keys).
+
 ## Migration output must satisfy the latest schema
 
 `registry.process()` re-validates the migrated document against the **latest**
@@ -263,6 +268,32 @@ Semantics:
 - Hooks must not throw; thrown errors propagate and abort `process(...)`.
   Wrap with `try/catch` in user code if you need at-most-once-delivery
   semantics.
+
+## Zod schemas: strict objects silently strip unknown keys
+
+`zodAdapter` returns the **parsed** output of `safeParse`, so validation is
+also a transformation: with plain `z.object`, any key the schema does not
+declare is silently dropped from `result.data`. For long-lived documents —
+this library's core use case — that is a data-loss footgun: a schema written
+for era N silently deletes fields added in era N+1 whenever older code
+processes newer documents, and hand-added fields vanish on round-trip.
+
+```ts
+const V1 = z.object({ title: z.string() }); // strict object
+zodAdapter(V1).validate({ title: 'x', newerField: 'kept?' });
+// → ok: true, data = { title: 'x' } — `newerField` is GONE, no warning.
+
+const V1loose = z.looseObject({ title: z.string() }); // loose object
+zodAdapter(V1loose).validate({ title: 'x', newerField: 'kept?' });
+// → ok: true, data = { title: 'x', newerField: 'kept?' } — preserved.
+```
+
+Recommendation: use loose objects for document schemas — `z.looseObject(...)`
+in zod 4, `z.object(...).passthrough()` in zod 3. Reach for strict objects
+only when stripping is exactly what you want (e.g. sanitizing an untrusted
+payload at a boundary). The Quick start and recipe examples in this README
+use strict objects for brevity; on real long-lived documents, prefer loose
+ones.
 
 ## Validators without Zod
 

@@ -54,6 +54,12 @@ const toValidationIssue = (issue: ZodIssue): ValidationIssue => ({
  * Zod-applied defaults, transforms or coercions are reflected in the data
  * that downstream migrations and consumers see).
  *
+ * Beware: because the parsed output replaces the input, a plain `z.object`
+ * schema silently strips every key it does not declare. For long-lived
+ * documents prefer loose objects — `z.looseObject(...)` in zod 4,
+ * `z.object(...).passthrough()` in zod 3 — so unknown keys survive the
+ * round-trip. Reach for strict objects only when stripping is intended.
+ *
  * On failure, every Zod issue becomes a {@link ValidationIssue} with:
  *
  * - `severity: 'error'`,
