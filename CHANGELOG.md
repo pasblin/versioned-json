@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0
+
+### Minor Changes
+
+- 4fb107b: Distinguish migration-output validation failures from source-document failures. Issues emitted by schema validators now carry a `stage: 'source' | 'migrated'` discriminator, and when the migrated output fails latest-schema validation the errors are prefixed with a synthetic `MIGRATION_OUTPUT_INVALID` issue pointing at the migration chain as the fix site. Additive only: existing error codes and result shapes are unchanged, and issues not tied to a validation stage (version detection, migration failures, deprecation warnings) remain unstaged.
+- 0ad51b0: Add first-class writer-exactness utilities to the `/zod` sub-entry: `collectUndeclaredPaths(schema, value)` returns the dot/bracket path of every key the schema does not declare, and `assertWriterExact(schema, value, context, devMode?)` turns that into a dev-mode guard for serialization points (throwing the new `WriterExactnessError`). Loose-object tolerance is not treated as declaration, substantive `.catchall` schemas are, wrappers unwrap to their carrier, arrays and discriminated-union variants recurse, and `undefined`-valued keys are skipped. Works with both zod 3 and zod 4.
+
 ## 0.1.0
 
 ### Minor Changes
