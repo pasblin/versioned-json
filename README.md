@@ -204,6 +204,42 @@ const doc = {
 fs.writeFileSync('out.json', JSON.stringify(doc, null, 2));
 ```
 
+#### Several unmarked eras: content-sniffing `resolveVersion`
+
+A constant `assumeVersion` only works when **all** unmarked legacy documents
+belong to one era. If the version field was introduced after more than one
+format change, the unmarked population splits into distinguishable
+generations and no single constant classifies them correctly. Derive the
+version from the document's shape instead, with `resolveVersion`:
+
+```ts
+// Era A (oldest): no marker, no `language` key.
+// Era B: no marker, HAS `language`.
+// Era C (current): explicit `_schemaVersion`.
+createRegistry({
+  schemas: [schemaV1, schemaV2, schemaV3],
+  migrations: [m1to2, m2to3],
+  latest: schemaV3,
+  resolveVersion: (input) => {
+    if (typeof input !== 'object' || input === null) return undefined;
+    const doc = input as Record<string, unknown>;
+    if (doc['_schemaVersion'] !== undefined) return doc['_schemaVersion'] as number;
+    return 'language' in doc ? 2 : 1; // shape-sniff the pre-marker eras
+  },
+});
+```
+
+Unlike `assumeVersion` — which must be bumped on every release — the
+sniffing resolver is **maintenance-free forever**: it only distinguishes
+pre-marker eras, which are frozen history, because every document written
+after adoption carries the marker explicitly.
+
+The usual `resolveVersion` rules apply (see
+[Custom version detection](#custom-version-detection)): the function must be
+pure; whatever version value it returns is validated through the comparator
+and rejected with `UNKNOWN_VERSION` when unsupported; returning `undefined`
+falls back to `assumeVersion` when configured, otherwise `MISSING_VERSION`.
+
 ## Custom version detection
 
 When the version is not at the root or follows a non-trivial encoding —
