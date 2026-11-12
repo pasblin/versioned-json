@@ -810,7 +810,7 @@ This repo uses [Changesets](https://github.com/changesets/changesets):
 3. The **Release** GitHub Action opens a "Version Packages" PR.
 4. Merging that PR publishes to npm automatically.
 
-You need to set the secret `NPM_TOKEN` in the repository for publishing.
+Publishing uses npm [trusted publishing](https://docs.npmjs.com/trusted-publishers) (OIDC), so the repository holds no npm token. The package's settings on npmjs.com must list a trusted publisher for this repository and the `release.yml` workflow, with direct `npm publish` allowed.
 
 ## License
 
